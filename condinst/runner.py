@@ -14,9 +14,15 @@ import numpy as np
 from cvpods.modeling.losses import iou_loss
 from dataset import build_train_loader
 
+from cvpods.structures import Instances
+from condinst import CondInst, DynamicMaskHead, MaskBranch
+from cvpods.modeling.losses import dice_loss
+from cvpods.layers import ShapeSpec
+
 @RUNNERS.register()
 class SemiRunner(DefaultRunner):
     def __init__(self, cfg, build_model):
+        self.device = torch.device(cfg.MODEL.DEVICE)
         self.ema_start = cfg.TRAINER.EMA.START_STEPS
         
         self._hooks = []
@@ -50,7 +56,7 @@ class SemiRunner(DefaultRunner):
                         self.model,
                         device_ids=[comm.get_local_rank()],
                         broadcast_buffers=False,
-                        find_unused_parameters=True
+                        find_unused_parameters=False
                     )
                 elif cfg.MODEL.DDP_BACKEND == "apex":
                     from apex.parallel import DistributedDataParallel as ApexDistributedDataParallel
@@ -133,6 +139,7 @@ class SemiRunner(DefaultRunner):
             ))
 
         def test_and_save_results():
+            logger.info('Evaluating')
             self._last_eval_results = self.test(self.cfg, self.model)
             return self._last_eval_results
 
@@ -223,6 +230,16 @@ class SemiRunner(DefaultRunner):
         loss_dict = loss_dict_sup
         # Train Logic
         if self.iter > self.burn_in_steps:
+            # Condinst parameters
+            self.mask_out_stride = self.cfg.MODEL.CONDINST.MASK_OUT_STRIDE
+            self.max_proposals = self.cfg.MODEL.CONDINST.MAX_PROPOSALS
+            self.topk_proposals_per_im = self.cfg.MODEL.CONDINST.TOPK_PROPOSALS_PER_IM
+            assert (self.max_proposals != -1) ^ (self.topk_proposals_per_im != -1),\
+                "MAX_PROPOSALS and TOPK_PROPOSALS_PER_IM " \
+                "cannot be set to -1 or enabled at the same time."
+            self.disable_rel_coords = self.cfg.MODEL.CONDINST.MASK_HEAD.DISABLE_REL_COORDS
+            self.mask_center_sample = self.cfg.MODEL.CONDINST.MASK_CENTER_SAMPLE
+            
             unsup_weight = self.cfg.TRAINER.DISTILL.UNSUP_WEIGHT
             if self.cfg.TRAINER.DISTILL.SUPPRESS=='exp':
                 target = self.burn_in_steps + 2000
@@ -239,15 +256,20 @@ class SemiRunner(DefaultRunner):
                     unsup_weight *= (self.iter-self.burn_in_steps)/self.burn_in_steps
 
                     
-            student_logits, student_deltas, student_quality = self.model(unsup_strong, get_data=True)
+            student_logits, student_deltas, student_quality, \
+                student_insts_mask = self.model(unsup_strong, get_data=True)
+            
             with torch.no_grad():
-                teacher_logits, teacher_deltas, teacher_quality = self.ema_model.model(unsup_weak, is_teacher=True)
-            loss_dict_unsup = self.get_distill_loss(student_logits, student_deltas, student_quality,
-                                                    teacher_logits, teacher_deltas, teacher_quality)
+                teacher_logits, teacher_deltas, teacher_quality, \
+                    teacher_insts_mask = self.ema_model.model(unsup_weak, is_teacher=True)
+            loss_dict_unsup = self.get_distill_loss(student_logits, student_deltas, student_quality, teacher_insts_mask,
+                                                    teacher_logits, teacher_deltas, teacher_quality, student_insts_mask,
+                                                    )
             distill_weights = {
                 "distill_loss_logits": self.cfg.TRAINER.DISTILL.WEIGHTS.LOGITS,
                 "distill_loss_deltas": self.cfg.TRAINER.DISTILL.WEIGHTS.DELTAS,
                 "distill_loss_quality": self.cfg.TRAINER.DISTILL.WEIGHTS.QUALITY,
+                "distill_loss_masks": self.cfg.TRAINER.DISTILL.WEIGHTS.MASKS,
                 "fore_ground_sum": 1.,
             }
             loss_dict_unsup = {k: (v * unsup_weight) if v.requires_grad else v for k, v in loss_dict_unsup.items()}
@@ -281,8 +303,27 @@ class SemiRunner(DefaultRunner):
         self.inner_iter += 1
 
     def get_distill_loss(self, 
-                         student_logits, student_deltas, student_quality, 
-                         teacher_logits, teacher_deltas, teacher_quality):
+                         student_logits, student_deltas, student_quality, teacher_insts_mask,
+                         teacher_logits, teacher_deltas, teacher_quality, student_insts_mask):
+        """
+        proposals (Instances):
+                A Instances class contains all sampled foreground information per batch,
+                thus len(proposals) depends on select_instances function. Two terms are
+                required for loss computation when len(proposals) > 0.
+                "pred_global_logits" term, shape (len(proposals), 1, mask_h, mask_w),
+                    stores predicted logits of foreground segmentation
+        Returns:
+            logits (list[Tensor]): #lvl tensors, each has shape (N, K, Hi, Wi).
+                The tensor predicts the classification probability
+                at each spatial position for each of the K object classes.
+            deltas (list[Tensor]): #lvl tensors, each has shape (N, 4, Hi, Wi).
+                The tensor predicts 4-vector (dl,dt,dr,db) box
+                regression values for every shift. These values are the
+                relative offset between the shift and the ground truth box.
+            quality (list[Tensor]): #lvl tensors, each has shape (N, 1, Hi, Wi).
+                The tensor predicts the centerness at each spatial position.
+        """      
+        
         num_classes = self.cfg.MODEL.FCOS.NUM_CLASSES
 
         student_logits = torch.cat([
@@ -339,10 +380,13 @@ class SemiRunner(DefaultRunner):
             reduction='mean'
         )
 
+        loss_mask = dice_loss(student_insts_mask, teacher_insts_mask).mean()    
+        
         return {
             "distill_loss_logits": loss_logits,
             "distill_loss_quality": loss_quality,
             "distill_loss_deltas": loss_deltas,
+            "distill_loss_masks": loss_mask,
             "fore_ground_sum": fg_num,
         }
 
