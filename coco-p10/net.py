@@ -4,7 +4,7 @@ from cvpods.layers import ShapeSpec
 from cvpods.modeling.anchor_generator import ShiftGenerator
 from cvpods.modeling.backbone import Backbone
 from cvpods.modeling.backbone.fpn import build_retinanet_resnet_fpn_backbone
-from fcos import FCOS
+from condinst import CondInst
 import dataset
 import runner
 
@@ -34,7 +34,7 @@ def build_model(cfg):
     cfg.build_backbone = build_backbone
     cfg.build_shift_generator = build_shift_generator
 
-    model = FCOS(cfg)
+    model = CondInst(cfg)
     # logger = logging.getLogger(__name__)
     # logger.info("Model:\n{}".format(model))
     return model
